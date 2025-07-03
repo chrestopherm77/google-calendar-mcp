@@ -1,181 +1,402 @@
-import { fileURLToPath } from "url";
-import { GoogleCalendarMcpServer } from './server.js';
-import { parseArgs } from './config/TransportConfig.js';
-import { readFileSync } from "fs";
-import { join, dirname } from "path";
+#!/usr/bin/env node
 
-// Import modular components
-import { initializeOAuth2Client } from './auth/client.js';
-import { AuthServer } from './auth/server.js';
+import { Server } from '@modelcontextprotocol/sdk/server/index.js';
+import { StdioServerTransport } from '@modelcontextprotocol/sdk/server/stdio.js';
+import {
+  CallToolRequestSchema,
+  ErrorCode,
+  ListToolsRequestSchema,
+  McpError,
+} from '@modelcontextprotocol/sdk/types.js';
+import { google } from 'googleapis';
+import { OAuth2Client } from 'google-auth-library';
+import fs from 'fs/promises';
+import path from 'path';
+import http from 'http';
+import url from 'url';
 
-// Get package version
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = dirname(__filename);
-const packageJsonPath = join(__dirname, '..', 'package.json');
-const packageJson = JSON.parse(readFileSync(packageJsonPath, 'utf-8'));
-const VERSION = packageJson.version;
-
-// --- Main Application Logic --- 
-async function main() {
-  try {
-    // Parse command line arguments
-    const config = parseArgs(process.argv.slice(2));
-    
-    // Create and initialize the server
-    const server = new GoogleCalendarMcpServer(config);
-    await server.initialize();
-    
-    // Start the server with the appropriate transport
-    await server.start();
-
-  } catch (error: unknown) {
-    process.stderr.write(`Failed to start server: ${error instanceof Error ? error.message : error}\n`);
-    process.exit(1);
-  }
-}
-
-
-// --- Command Line Interface ---
-async function runAuthServer(): Promise<void> {
-  // Use the same logic as auth-server.ts
-  try {
-    // Initialize OAuth client
-    const oauth2Client = await initializeOAuth2Client();
-
-    // Create and start the auth server
-    const authServerInstance = new AuthServer(oauth2Client);
-
-    // Start with browser opening (true by default)
-    const success = await authServerInstance.start(true);
-
-    if (!success && !authServerInstance.authCompletedSuccessfully) {
-      // Failed to start and tokens weren't already valid
-      process.stderr.write(
-        "Authentication failed. Could not start server or validate existing tokens. Check port availability (3000-3004) and try again.\n"
-      );
-      process.exit(1);
-    } else if (authServerInstance.authCompletedSuccessfully) {
-      // Auth was successful (either existing tokens were valid or flow completed just now)
-      process.stderr.write("Authentication successful.\n");
-      process.exit(0); // Exit cleanly if auth is already done
-    }
-
-    // If we reach here, the server started and is waiting for the browser callback
-    process.stderr.write(
-      "Authentication server started. Please complete the authentication in your browser...\n"
+class GoogleCalendarServer {
+  constructor() {
+    this.server = new Server(
+      {
+        name: 'google-calendar-mcp',
+        version: '0.1.0',
+      },
+      {
+        capabilities: {
+          tools: {},
+        },
+      }
     );
 
-    // Wait for completion
-    const intervalId = setInterval(async () => {
-      if (authServerInstance.authCompletedSuccessfully) {
-        clearInterval(intervalId);
-        await authServerInstance.stop();
-        process.stderr.write("Authentication completed successfully!\n");
-        process.exit(0);
+    this.oauth2Client = null;
+    this.calendar = null;
+    this.setupToolHandlers();
+    
+    // Error handling
+    this.server.onerror = (error) => console.error('[MCP Error]', error);
+    process.on('SIGINT', async () => {
+      await this.server.close();
+      process.exit(0);
+    });
+  }
+
+  async initializeAuth() {
+    try {
+      // Tenta ler credenciais da variável de ambiente primeiro
+      let credentials;
+      
+      if (process.env.GOOGLE_CALENDAR_CREDENTIALS) {
+        console.log('📱 Lendo credenciais da variável de ambiente...');
+        credentials = JSON.parse(process.env.GOOGLE_CALENDAR_CREDENTIALS);
+      } else {
+        // Fallback para arquivo (para desenvolvimento local)
+        console.log('📁 Lendo credenciais do arquivo...');
+        const credentialsPath = path.join(process.cwd(), 'gcp-oauth-keys.json');
+        const credentialsContent = await fs.readFile(credentialsPath, 'utf8');
+        credentials = JSON.parse(credentialsContent);
       }
-    }, 1000);
-  } catch (error) {
-    process.stderr.write(`Authentication failed: ${error}\n`);
-    process.exit(1);
-  }
-}
 
-function showHelp(): void {
-  process.stdout.write(`
-Google Calendar MCP Server v${VERSION}
+      const { client_id, client_secret, redirect_uris } = credentials.web || credentials.installed;
+      
+      this.oauth2Client = new OAuth2Client(
+        client_id,
+        client_secret,
+        redirect_uris[0]
+      );
 
-Usage:
-  npx @cocal/google-calendar-mcp [command]
-
-Commands:
-  auth     Run the authentication flow
-  start    Start the MCP server (default)
-  version  Show version information
-  help     Show this help message
-
-Examples:
-  npx @cocal/google-calendar-mcp auth
-  npx @cocal/google-calendar-mcp start
-  npx @cocal/google-calendar-mcp version
-  npx @cocal/google-calendar-mcp
-
-Environment Variables:
-  GOOGLE_OAUTH_CREDENTIALS    Path to OAuth credentials file
-`);
-}
-
-function showVersion(): void {
-  process.stdout.write(`Google Calendar MCP Server v${VERSION}\n`);
-}
-
-// --- Exports & Execution Guard --- 
-// Export main for testing or potential programmatic use
-export { main, runAuthServer };
-
-// Parse CLI arguments
-function parseCliArgs(): { command: string | undefined } {
-  const args = process.argv.slice(2);
-  let command: string | undefined;
-
-  for (let i = 0; i < args.length; i++) {
-    const arg = args[i];
-    
-    // Handle special version/help flags as commands
-    if (arg === '--version' || arg === '-v' || arg === '--help' || arg === '-h') {
-      command = arg;
-      continue;
-    }
-    
-    // Skip transport options and their values
-    if (arg === '--transport' || arg === '--port' || arg === '--host') {
-      i++; // Skip the next argument (the value)
-      continue;
-    }
-    
-    // Skip other flags
-    if (arg === '--debug') {
-      continue;
-    }
-    
-    // Check for command (first non-option argument)
-    if (!command && !arg.startsWith('--')) {
-      command = arg;
-      continue;
+      // Tenta carregar token salvo
+      await this.loadTokens();
+      
+      this.calendar = google.calendar({ version: 'v3', auth: this.oauth2Client });
+      
+      console.log('✅ Autenticação inicializada com sucesso!');
+    } catch (error) {
+      console.error('❌ Erro ao inicializar autenticação:', error.message);
+      throw error;
     }
   }
 
-  return { command };
+  async loadTokens() {
+    try {
+      const tokenPath = process.env.GOOGLE_CALENDAR_MCP_TOKEN_PATH || '/tmp/tokens.json';
+      
+      // Tenta ler tokens salvos
+      try {
+        const tokensContent = await fs.readFile(tokenPath, 'utf8');
+        const tokens = JSON.parse(tokensContent);
+        this.oauth2Client.setCredentials(tokens);
+        console.log('🔑 Tokens carregados com sucesso');
+      } catch (error) {
+        console.log('⚠️  Nenhum token salvo encontrado. Será necessário autenticar.');
+      }
+    } catch (error) {
+      console.error('❌ Erro ao carregar tokens:', error.message);
+    }
+  }
+
+  async saveTokens(tokens) {
+    try {
+      const tokenPath = process.env.GOOGLE_CALENDAR_MCP_TOKEN_PATH || '/tmp/tokens.json';
+      await fs.writeFile(tokenPath, JSON.stringify(tokens, null, 2));
+      console.log('💾 Tokens salvos com sucesso');
+    } catch (error) {
+      console.error('❌ Erro ao salvar tokens:', error.message);
+    }
+  }
+
+  setupToolHandlers() {
+    this.server.setRequestHandler(ListToolsRequestSchema, async () => ({
+      tools: [
+        {
+          name: 'list_events',
+          description: 'Lista eventos do Google Calendar',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              timeMin: {
+                type: 'string',
+                description: 'Data/hora mínima (ISO 8601)',
+              },
+              timeMax: {
+                type: 'string',
+                description: 'Data/hora máxima (ISO 8601)',
+              },
+              maxResults: {
+                type: 'number',
+                description: 'Número máximo de eventos (padrão: 10)',
+                default: 10,
+              },
+            },
+          },
+        },
+        {
+          name: 'create_event',
+          description: 'Cria um novo evento no Google Calendar',
+          inputSchema: {
+            type: 'object',
+            properties: {
+              summary: {
+                type: 'string',
+                description: 'Título do evento',
+              },
+              description: {
+                type: 'string',
+                description: 'Descrição do evento',
+              },
+              start: {
+                type: 'string',
+                description: 'Data/hora de início (ISO 8601)',
+              },
+              end: {
+                type: 'string',
+                description: 'Data/hora de fim (ISO 8601)',
+              },
+            },
+            required: ['summary', 'start', 'end'],
+          },
+        },
+        {
+          name: 'get_auth_url',
+          description: 'Obtém URL para autenticação OAuth',
+          inputSchema: {
+            type: 'object',
+            properties: {},
+          },
+        },
+      ],
+    }));
+
+    this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
+      const { name, arguments: args } = request.params;
+
+      try {
+        switch (name) {
+          case 'get_auth_url':
+            return await this.getAuthUrl();
+
+          case 'list_events':
+            return await this.listEvents(args);
+
+          case 'create_event':
+            return await this.createEvent(args);
+
+          default:
+            throw new McpError(
+              ErrorCode.MethodNotFound,
+              `Ferramenta desconhecida: ${name}`
+            );
+        }
+      } catch (error) {
+        if (error.code === 401) {
+          return {
+            content: [
+              {
+                type: 'text',
+                text: `❌ Erro de autenticação. Use a ferramenta 'get_auth_url' para obter o link de autenticação.\n\nErro: ${error.message}`,
+              },
+            ],
+          };
+        }
+        
+        throw new McpError(
+          ErrorCode.InternalError,
+          `Erro na ferramenta ${name}: ${error.message}`
+        );
+      }
+    });
+  }
+
+  async getAuthUrl() {
+    const scopes = ['https://www.googleapis.com/auth/calendar'];
+    
+    const authUrl = this.oauth2Client.generateAuthUrl({
+      access_type: 'offline',
+      scope: scopes,
+      prompt: 'consent',
+    });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `🔗 **Link de Autenticação Google Calendar:**\n\n${authUrl}\n\n📝 **Instruções:**\n1. Clique no link acima\n2. Faça login na sua conta Google\n3. Autorize o acesso ao Calendar\n4. Copie o código de autorização\n5. Use esse código para completar a autenticação`,
+        },
+      ],
+    };
+  }
+
+  async listEvents(args = {}) {
+    const {
+      timeMin = new Date().toISOString(),
+      timeMax,
+      maxResults = 10,
+    } = args;
+
+    const response = await this.calendar.events.list({
+      calendarId: 'primary',
+      timeMin,
+      timeMax,
+      maxResults,
+      singleEvents: true,
+      orderBy: 'startTime',
+    });
+
+    const events = response.data.items || [];
+    
+    if (events.length === 0) {
+      return {
+        content: [
+          {
+            type: 'text',
+            text: '📅 Nenhum evento encontrado no período especificado.',
+          },
+        ],
+      };
+    }
+
+    const eventList = events.map((event, index) => {
+      const start = event.start?.dateTime || event.start?.date;
+      const end = event.end?.dateTime || event.end?.date;
+      
+      return `${index + 1}. **${event.summary || 'Sem título'}**
+   📅 Início: ${new Date(start).toLocaleString('pt-BR')}
+   ⏰ Fim: ${new Date(end).toLocaleString('pt-BR')}
+   📝 Descrição: ${event.description || 'Nenhuma'}
+   🔗 Link: ${event.htmlLink || 'N/A'}`;
+    }).join('\n\n');
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `📅 **Eventos encontrados (${events.length}):**\n\n${eventList}`,
+        },
+      ],
+    };
+  }
+
+  async createEvent(args) {
+    const { summary, description, start, end } = args;
+
+    const event = {
+      summary,
+      description,
+      start: {
+        dateTime: start,
+        timeZone: 'America/Sao_Paulo',
+      },
+      end: {
+        dateTime: end,
+        timeZone: 'America/Sao_Paulo',
+      },
+    };
+
+    const response = await this.calendar.events.insert({
+      calendarId: 'primary',
+      resource: event,
+    });
+
+    return {
+      content: [
+        {
+          type: 'text',
+          text: `✅ **Evento criado com sucesso!**
+
+📅 **Título:** ${response.data.summary}
+🗓️ **Início:** ${new Date(response.data.start.dateTime).toLocaleString('pt-BR')}
+⏰ **Fim:** ${new Date(response.data.end.dateTime).toLocaleString('pt-BR')}
+🔗 **Link:** ${response.data.htmlLink}
+🆔 **ID:** ${response.data.id}`,
+        },
+      ],
+    };
+  }
+
+  async run() {
+    // Para ambiente web/HTTP
+    if (process.env.PORT || process.env.NODE_ENV === 'production') {
+      console.log('🌐 Iniciando servidor HTTP...');
+      await this.initializeAuth();
+      this.startHttpServer();
+    } else {
+      // Para ambiente MCP local
+      console.log('🔌 Iniciando servidor MCP (stdio)...');
+      await this.initializeAuth();
+      const transport = new StdioServerTransport();
+      await this.server.connect(transport);
+    }
+  }
+
+  startHttpServer() {
+    const port = process.env.PORT || 3000;
+    
+    const server = http.createServer(async (req, res) => {
+      const parsedUrl = url.parse(req.url, true);
+      
+      // CORS headers
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+      
+      if (req.method === 'OPTIONS') {
+        res.writeHead(200);
+        res.end();
+        return;
+      }
+
+      if (req.method === 'GET' && parsedUrl.pathname === '/') {
+        res.writeHead(200, { 'Content-Type': 'text/html; charset=utf-8' });
+        res.end(`
+          <!DOCTYPE html>
+          <html>
+          <head>
+            <title>Google Calendar MCP</title>
+            <meta charset="utf-8">
+          </head>
+          <body>
+            <h1>🗓️ Google Calendar MCP Server</h1>
+            <p>✅ Servidor rodando com sucesso!</p>
+            <p>🔗 <strong>URL do servidor:</strong> ${req.headers.host}</p>
+            <p>📝 <strong>Status:</strong> Online</p>
+            <hr>
+            <h3>🛠️ Ferramentas disponíveis:</h3>
+            <ul>
+              <li><code>get_auth_url</code> - Obter URL de autenticação</li>
+              <li><code>list_events</code> - Listar eventos</li>
+              <li><code>create_event</code> - Criar evento</li>
+            </ul>
+            <hr>
+            <p><small>Para usar este servidor, configure-o como um MCP server no Claude Desktop.</small></p>
+          </body>
+          </html>
+        `);
+        return;
+      }
+
+      if (req.method === 'GET' && parsedUrl.pathname === '/health') {
+        res.writeHead(200, { 'Content-Type': 'application/json' });
+        res.end(JSON.stringify({ 
+          status: 'ok', 
+          service: 'google-calendar-mcp',
+          timestamp: new Date().toISOString()
+        }));
+        return;
+      }
+
+      // 404 para outras rotas
+      res.writeHead(404, { 'Content-Type': 'text/plain' });
+      res.end('404 - Página não encontrada');
+    });
+
+    server.listen(port, '0.0.0.0', () => {
+      console.log(`🚀 Servidor HTTP rodando na porta ${port}`);
+      console.log(`🌐 URL: http://localhost:${port}`);
+      console.log(`📡 Render URL: https://google-calendar-mcp-zm4.onrender.com`);
+    });
+  }
 }
 
-// CLI logic here (run always)
-const { command } = parseCliArgs();
-
-switch (command) {
-  case "auth":
-    runAuthServer().catch((error) => {
-      process.stderr.write(`Authentication failed: ${error}\n`);
-      process.exit(1);
-    });
-    break;
-  case "start":
-  case void 0:
-    main().catch((error) => {
-      process.stderr.write(`Failed to start server: ${error}\n`);
-      process.exit(1);
-    });
-    break;
-  case "version":
-  case "--version":
-  case "-v":
-    showVersion();
-    break;
-  case "help":
-  case "--help":
-  case "-h":
-    showHelp();
-    break;
-  default:
-    process.stderr.write(`Unknown command: ${command}\n`);
-    showHelp();
-    process.exit(1);
-}
+// Inicia o servidor
+const server = new GoogleCalendarServer();
+server.run().catch(console.error);
